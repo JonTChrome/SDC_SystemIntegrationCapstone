@@ -2,7 +2,7 @@
 import numpy as np
 import rospy
 from std_msgs.msg import Int32
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from styx_msgs.msg import Lane, Waypoint
 from scipy.spatial import KDTree
 import math
@@ -24,7 +24,8 @@ TODO (for Yousuf and Aaron): Stopline location for each traffic light.
 
 LOOKAHEAD_WPS = 20 # Number of waypoints we will publish. You can change this number
 OFFSET = 5
-MAX_DECEL = 0.5
+DECEL_RATE = 0.3
+STOP_COUNTER_THRESHOLD = OFFSET + LOOKAHEAD_WPS
 
 class WaypointUpdater(object):
     def __init__(self):
@@ -35,35 +36,35 @@ class WaypointUpdater(object):
         self.waypoints_2d = None
         self.waypoint_tree = None
         self.light_wp = None
-        self.closest_waypoint_idx = None
+        self.current_vel = None
         
         rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
         rospy.Subscriber('/traffic_waypoint', Int32, self.traffic_cb)
 
         self.base_waypoints_sub = rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
         self.final_waypoints_pub = rospy.Publisher('/final_waypoints', Lane, queue_size=1)
+        rospy.Subscriber('/current_velocity', TwistStamped, self.velocity_cb)
 
         self.loop()
         rospy.spin()
     
     def loop(self):
-        rate = rospy.Rate(20)
+        rate = rospy.Rate(5)
         while not rospy.is_shutdown():
-            if self.pose and self.base_waypoints:
-                self.set_closest_waypoint_idx()
-                self.publish_waypoints()
+            if self.pose and self.base_waypoints and self.waypoint_tree:
+                current_idx = self.set_closest_waypoint_idx()
+                self.publish_waypoints(current_idx, self.light_idx)
             rate.sleep()
 
-    def red_light_ahead(self):
-        if self.light_idx == None or self.base_waypoints == None:
+    def red_light_ahead(self, current_idx, light_idx):
+        if not light_idx:
             return False
-        elif self.light_idx >= len(self.base_waypoints.waypoints): 
+        elif light_idx >= len(self.base_waypoints.waypoints): 
             return True
+        elif light_idx == -1:
+            return False
         else:
-            self.light_wp = self.waypoints_2d[self.light_idx]
-            distance = self.distance(self.closest_waypoint_idx, self.light_idx)
-
-            if self.ahead_of(self.light_wp, self.closest_waypoint_idx) and distance <= 33: 
+            if light_idx > current_idx:
                 return True
             else:
                 return False
@@ -71,17 +72,15 @@ class WaypointUpdater(object):
     def set_closest_waypoint_idx(self):
         x = self.pose.position.x
         y = self.pose.position.y
-        if self.waypoint_tree == None:
-            return None
 
         closest_idx = self.waypoint_tree.query([x, y], 1)[1]
 
         closest_coord = self.waypoints_2d[closest_idx]
-        prev_coord = self.waypoints_2d[closest_idx - 1]
-        if self.ahead_of(closest_coord, prev_coord):
-            self.closest_waypoint_idx = closest_idx
+        
+        if self.ahead_of(closest_coord, [x, y]):
+            return closest_idx
         else:
-            self.closest_waypoint_idx = (closest_idx + 1) % len(self.waypoints_2d)
+            return (closest_idx + 1) % len(self.waypoints_2d)
     
     def ahead_of(self, wp1, wp2):
         x = self.pose.position.x
@@ -92,9 +91,9 @@ class WaypointUpdater(object):
         pos_vect = np.array([x, y])
         val = np.dot(cl_vect - prev_vect, pos_vect - cl_vect)
         if val > 0:
-            return False
-        else:
             return True
+        else:
+            return False
 
     def generate_temp_waypoints(self):
         lane = Lane()
@@ -105,38 +104,40 @@ class WaypointUpdater(object):
         lane.waypoints = self.base_waypoints.waypoints[self.closest_waypoint_idx + OFFSET: last_index]
         return lane
 
-    def publish_waypoints(self):
-        final_lane = self.generate_lane()
-        if final_lane != None:
-            self.final_waypoints_pub.publish(final_lane)
+    def publish_waypoints(self, current_idx, light_idx):
+        final_lane = self.generate_lane(current_idx, light_idx)
+        self.final_waypoints_pub.publish(final_lane)
 
-    def generate_lane(self):
+    def generate_lane(self, current_idx, light_idx):
         lane = Lane()
-        if self.closest_waypoint_idx == None:
-            return None
-            
-        farthest_idx = min(len(self.base_waypoints.waypoints), self.closest_waypoint_idx + LOOKAHEAD_WPS + OFFSET)
+        farthest_idx = min(len(self.base_waypoints.waypoints), current_idx + LOOKAHEAD_WPS + OFFSET)
 
-        current_waypoints = self.base_waypoints.waypoints[self.closest_waypoint_idx + OFFSET:farthest_idx]
-        if self.red_light_ahead():
-            lane.waypoints = self.decelerate_waypoints(current_waypoints)            
+        current_waypoints = self.base_waypoints.waypoints[current_idx + OFFSET:farthest_idx]
+        light_ahead = self.red_light_ahead(current_idx, light_idx)
+        if light_ahead:
+            lane.waypoints = self.decelerate_waypoints(current_waypoints, current_idx, light_idx)            
         else:
             lane.waypoints = current_waypoints
         return lane
 
-    def decelerate_waypoints(self, waypoints):
+    def decelerate_waypoints(self, waypoints, current_idx, light_idx):
         temp = []
+       
         for i, wp in enumerate(waypoints):
             p = Waypoint()
             p.pose = wp.pose
-
-            stop_idx = max(self.light_idx - self.closest_waypoint_idx - 2, 0)
-            dist = self.distance(i, stop_idx)
-            vel = math.sqrt(2 * MAX_DECEL * dist)
-            if vel < 1.:
-                vel = 0.
             
-            p.twist.twist.linear.x = min(0, wp.twist.twist.linear.x)
+            stop_idx = max(light_idx - current_idx - 2, 0)
+            dist = self.distance(i, stop_idx)
+            vel = self.current_vel
+            if i >= stop_idx:
+                vel = 0
+            elif dist < 25:
+                vel = DECEL_RATE * dist
+            
+            if vel < 1:
+                vel = 0
+            p.twist.twist.linear.x = vel
             temp.append(p)
         return temp
 
@@ -153,11 +154,13 @@ class WaypointUpdater(object):
 
     def traffic_cb(self, msg):
         self.light_idx = msg.data
-        pass
-
+       
     def obstacle_cb(self, msg):
         # TODO: Callback for /obstacle_waypoint message. We will implement it later
         pass
+    
+    def velocity_cb(self, velocity):
+        self.current_vel = velocity.twist.linear.x
 
     def distance(self, wp1, wp2):
         dist = 0

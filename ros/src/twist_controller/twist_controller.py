@@ -5,7 +5,7 @@ from pid import PID
 
 GAS_DENSITY = 2.858
 ONE_MPH = 0.44704
-
+MAX_DECEL = 15
 
 class Controller(object):
     def __init__(self, vehicle_mass, fuel_capacity, brake_deadband, decel_limit, accel_limit, wheel_radius, wheel_base, steer_ratio, max_lat_accel, max_steer_angle, dbw_enabled):
@@ -35,22 +35,26 @@ class Controller(object):
         target = args[0]
         current = args[1]
         dt = args[2]
+        linear_vel = target.linear.x
+        current_vel = current.linear.x
+
         if self.dbw_enabled is False:
             self.speed_controller.reset()
             self.steering_controller.reset()
+            return 0, 0, 0
 
-        error = target.linear.x - current.linear.x
-        velocity = self.speed_controller.step(error, dt)
-
-        if velocity > 0:
-            throttle = max(0.0, min(1.0,velocity))
-            brake = 0.0
-        else:
+        error = linear_vel - current_vel
+        throttle = self.speed_controller.step(error, dt)
+        brake = 0
+        
+        if linear_vel == 0. and current_vel < 0.1:
             throttle = 0.0
-            brake = (self.vehicle_mass + self.fuel_capacity * GAS_DENSITY) * self.wheel_radius * abs(velocity)
+            brake = 450
+        elif throttle < 0.1 and error < 0:
+            throttle = 0.0
+            brake = (self.vehicle_mass + self.fuel_capacity * GAS_DENSITY) * self.wheel_radius * min(abs(error), MAX_DECEL)
 
         steering = self.yaw_controller.get_steering(target.linear.x, target.angular.z, current.linear.x)
         steering = self.lpf.filt(steering)
-
 
         return throttle, brake, steering
